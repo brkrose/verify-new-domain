@@ -94,7 +94,7 @@ Both files are gitignored — they live only on your machine.
 
 ## Credit
 
-Built for the [Brooke Builds Stuff](https://brookebuildsstuff.com) portfolio workflow.
+Built for the [Brooke Builds Stuff](https://brooke-builds-stuff.com) portfolio workflow.
 
 ## License
 
