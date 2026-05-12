@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""verify-new-domain: register a domain with Google Search Console + Bing Webmaster.
+
+Usage:
+  verify-new-domain setup-google   # one-time OAuth dance
+  verify-new-domain setup-bing     # paste API key
+  verify-new-domain <domain> [--sitemap URL] [--skip-bing] [--skip-google]
+"""
+import argparse
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import urllib.error
+import webbrowser
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "verify-domain"
+GOOGLE_CRED_FILE = CONFIG_DIR / "google.json"
+BING_CRED_FILE = CONFIG_DIR / "bing.json"
+GOOGLE_SCOPES = " ".join([
+    "https://www.googleapis.com/auth/siteverification",
+    "https://www.googleapis.com/auth/webmasters",
+])
+
+# ----- utils -----
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def info(msg): print(f"==> {msg}")
+def ok(msg):   print(f"  ✓ {msg}")
+def warn(msg): print(f"  ! {msg}")
+
+def http(method, url, headers=None, data=None):
+    headers = dict(headers or {})
+    body = None
+    if data is not None:
+        if isinstance(data, (dict, list)):
+            body = json.dumps(data).encode()
+            headers.setdefault("Content-Type", "application/json")
+        else:
+            body = data.encode() if isinstance(data, str) else data
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as r:
+            raw = r.read().decode()
+            return r.status, (json.loads(raw) if raw else {}), raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try: parsed = json.loads(raw)
+        except Exception: parsed = {}
+        return e.code, parsed, raw
+
+def ensure_config_dir():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+
+def save_json(path, obj):
+    ensure_config_dir()
+    path.write_text(json.dumps(obj, indent=2))
+    os.chmod(path, 0o600)
+
+def load_json(path):
+    if not path.exists(): return None
+    return json.loads(path.read_text())
+
+# ----- google oauth -----
+
+def google_setup():
+    print("""
+One-time Google OAuth setup.
+
+You need:
+  1. A Google Cloud project with the Site Verification API and Search Console API enabled.
+  2. An OAuth 2.0 Client ID of type "Desktop app".
+
+Steps:
+  - https://console.cloud.google.com/apis/library  → enable "Site Verification API" and "Google Search Console API"
+  - https://console.cloud.google.com/apis/credentials  → Create Credentials → OAuth client ID → Desktop app
+  - Copy the Client ID and Client Secret below.
+""")
+    client_id = input("Client ID: ").strip()
+    client_secret = input("Client Secret: ").strip()
+    if not client_id or not client_secret:
+        die("client id/secret required")
+
+    # local loopback server
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
+    redirect = f"http://127.0.0.1:{port}/"
+    state = secrets.token_urlsafe(16)
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": client_id, "redirect_uri": redirect, "response_type": "code",
+        "scope": GOOGLE_SCOPES, "access_type": "offline", "prompt": "consent", "state": state,
+    })
+
+    captured = {}
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a, **k): pass
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            captured.update({k: v[0] for k, v in q.items()})
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+            self.wfile.write(b"<h2>OAuth complete. You can close this tab.</h2>")
+
+    srv = HTTPServer(("127.0.0.1", port), H)
+    info(f"Opening browser to authorize...")
+    webbrowser.open(auth_url)
+    print(f"(If browser didn't open, visit: {auth_url})")
+    srv.handle_request()
+    if captured.get("state") != state: die("OAuth state mismatch")
+    if "code" not in captured: die(f"OAuth failed: {captured}")
+
+    status, body, raw = http("POST", "https://oauth2.googleapis.com/token", data=urllib.parse.urlencode({
+        "code": captured["code"], "client_id": client_id, "client_secret": client_secret,
+        "redirect_uri": redirect, "grant_type": "authorization_code",
+    }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if status != 200: die(f"token exchange failed: {raw}")
+    if "refresh_token" not in body: die("no refresh_token returned — revoke prior grant at https://myaccount.google.com/permissions and retry")
+
+    save_json(GOOGLE_CRED_FILE, {
+        "client_id": client_id, "client_secret": client_secret, "refresh_token": body["refresh_token"],
+    })
+    ok(f"Saved to {GOOGLE_CRED_FILE}")
+
+def google_access_token():
+    creds = load_json(GOOGLE_CRED_FILE)
+    if not creds: die("run: verify-new-domain setup-google")
+    status, body, raw = http("POST", "https://oauth2.googleapis.com/token", data=urllib.parse.urlencode({
+        "client_id": creds["client_id"], "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"], "grant_type": "refresh_token",
+    }).encode(), headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if status != 200: die(f"refresh failed: {raw}")
+    return body["access_token"]
+
+# ----- bing setup -----
+
+def bing_setup():
+    print("""
+One-time Bing Webmaster API setup.
+
+Steps:
+  - Go to https://www.bing.com/webmasters
+  - Sign in → click your profile (top right) → "API access"
+  - Click "Show" or "Generate" → copy the API Key
+""")
+    api_key = input("Bing API Key: ").strip()
+    if not api_key: die("api key required")
+    save_json(BING_CRED_FILE, {"api_key": api_key})
+    ok(f"Saved to {BING_CRED_FILE}")
+
+def bing_key():
+    creds = load_json(BING_CRED_FILE)
+    if not creds: die("run: verify-new-domain setup-bing")
+    return creds["api_key"]
+
+# ----- vercel DNS -----
+
+def vercel_dns_list(domain):
+    r = subprocess.run(["vercel", "dns", "ls", domain], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"vercel dns ls failed: {r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout
+
+def vercel_dns_add(domain, name, rtype, value):
+    existing = vercel_dns_list(domain)
+    # crude idempotency: skip if value already present
+    if value in existing:
+        warn(f"{rtype} record with value already present, skipping")
+        return
+    r = subprocess.run(["vercel", "dns", "add", domain, name, rtype, value], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"vercel dns add failed: {r.stderr.strip() or r.stdout.strip()}")
+    ok(f"added {rtype} {name} -> {value[:60]}...")
+
+# ----- google flow -----
+
+def google_register(domain, sitemap_url, token):
+    auth = {"Authorization": f"Bearer {token}"}
+    info("Google: requesting verification token")
+    status, body, raw = http(
+        "POST", "https://www.googleapis.com/siteVerification/v1/token",
+        headers=auth,
+        data={"verificationMethod": "DNS_TXT", "site": {"type": "INET_DOMAIN", "identifier": domain}},
+    )
+    if status != 200: die(f"getToken failed: {raw}")
+    txt = body["token"]
+    ok(f"token: {txt[:50]}...")
+
+    info("Google: adding TXT to Vercel DNS")
+    vercel_dns_add(domain, "@", "TXT", txt)
+
+    info("Google: waiting 30s for DNS propagation")
+    time.sleep(30)
+
+    info("Google: triggering verification")
+    for attempt in range(4):
+        status, body, raw = http(
+            "POST",
+            "https://www.googleapis.com/siteVerification/v1/webResource?verificationMethod=DNS_TXT",
+            headers=auth,
+            data={"site": {"type": "INET_DOMAIN", "identifier": domain}},
+        )
+        if status == 200:
+            ok("verified with Google Site Verification API")
+            break
+        warn(f"attempt {attempt+1}/4: {body.get('error', {}).get('message', raw[:200])}")
+        time.sleep(20)
+    else:
+        die("Google verification did not succeed after retries — TXT may need more time; rerun later")
+
+    info("Google: adding sc-domain property to Search Console")
+    sc_id = urllib.parse.quote(f"sc-domain:{domain}", safe="")
+    status, body, raw = http("PUT", f"https://www.googleapis.com/webmasters/v3/sites/{sc_id}", headers=auth)
+    if status in (200, 204): ok("added to Search Console")
+    else: warn(f"Search Console add returned {status}: {raw[:200]}")
+
+    info(f"Google: submitting sitemap {sitemap_url}")
+    sm = urllib.parse.quote(sitemap_url, safe="")
+    status, body, raw = http("PUT", f"https://www.googleapis.com/webmasters/v3/sites/{sc_id}/sitemaps/{sm}", headers=auth)
+    if status in (200, 204): ok("sitemap submitted")
+    else: warn(f"sitemap submit returned {status}: {raw[:200]}")
+
+# ----- bing flow -----
+
+BING_BASE = "https://ssl.bing.com/webmaster/api.svc/json"
+
+def bing_call(method, path, params=None, body=None):
+    params = dict(params or {}); params["apikey"] = bing_key()
+    url = f"{BING_BASE}/{path}?" + urllib.parse.urlencode(params)
+    return http(method, url, data=body)
+
+def bing_register(domain, sitemap_url):
+    site_url = f"https://{domain}/"
+
+    info("Bing: adding site")
+    status, body, raw = bing_call("POST", "AddSite", body={"siteUrl": site_url})
+    if status == 200: ok("site added")
+    else: warn(f"AddSite returned {status}: {raw[:200]} (may already exist)")
+
+    # Bing's REST API doesn't expose the per-site CNAME verification token,
+    # so we hand off to the UI verify flow and try the sitemap submit anyway —
+    # SubmitSitemap will fail if unverified, succeed once you click Verify.
+    verify_url = f"https://www.bing.com/webmasters/home?siteUrl={urllib.parse.quote(site_url, safe='')}&state=verifySite"
+    info(f"Bing: opening verify page so you can pick CNAME and click Verify")
+    print(f"   {verify_url}")
+    try: subprocess.run(["open", verify_url], check=False)
+    except Exception: pass
+
+    info("Bing: sitemap will be auto-discovered after verification, or submit via Bing UI > Sitemaps")
+    info("Bing: note — if you have GSC linked to Bing (Settings > Google search console accounts), the site auto-imports within 24h regardless")
+
+# ----- cli -----
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("target", help="domain (e.g. splitski.ai) or subcommand (setup-google/setup-bing)")
+    p.add_argument("--sitemap", help="sitemap URL (default: https://<domain>/sitemap.xml)")
+    p.add_argument("--skip-google", action="store_true")
+    p.add_argument("--skip-bing", action="store_true")
+    args = p.parse_args()
+
+    if args.target == "setup-google": return google_setup()
+    if args.target == "setup-bing":   return bing_setup()
+
+    domain = args.target.strip().lower().removeprefix("http://").removeprefix("https://").rstrip("/")
+    sitemap_url = args.sitemap or f"https://{domain}/sitemap.xml"
+
+    print(f"Registering {domain}")
+    print(f"Sitemap: {sitemap_url}")
+    print()
+
+    if not args.skip_google:
+        token = google_access_token()
+        google_register(domain, sitemap_url, token)
+        print()
+    if not args.skip_bing:
+        bing_register(domain, sitemap_url)
+        print()
+    info("done")
+
+if __name__ == "__main__":
+    main()
